@@ -1,0 +1,135 @@
+# =========================
+# Ephemeral API (1h) with Cloudflare Tunnel + LocalTunnel fallback
+# This GitHub Actions workflow:
+#   1) Checks out your repo on a temporary Linux VM ("runner").
+#   2) Installs Python + your dependencies.
+#   3) Starts your FastAPI app with uvicorn on port 8000 (in background).
+#   4) Tries to expose it to the public internet via a Cloudflare "quick tunnel".
+#      - If Cloudflare fails, it falls back to LocalTunnel.
+#   5) Keeps the runner alive for ~60 minutes so the URL stays reachable.
+#   6) Cleans up (stops uvicorn and tunnels) even if the job fails.
+# =========================
+
+name: Ephemeral API (1h with fallback)  # Friendly name shown in the "Actions" tab and runs list.
+
+on:                                      # Triggers that start this workflow.
+  workflow_dispatch:                     # Allows manual runs from GitHub UI (Actions > Run workflow).
+    inputs:                              # Define inputs the user can provide when starting the workflow.
+      minutes:                           # Input name (string). We use it for display/timebox elsewhere if needed.
+        description: 'How long to keep the API alive'     # UI help text.
+        type: choice                     # Limit allowed values to a predefined set (safe parsing).
+        options: [ '5','10','15','30','45','60','90','120','180','240','300','360' ]  # Valid minute choices.
+        default: '60'                    # Default selection if the user doesn't choose one.
+
+jobs:                                    # A workflow is composed of one or more jobs.
+  run-api:                               # Job ID (arbitrary). Holds all steps to run our ephemeral API.
+    runs-on: ubuntu-latest               # Use GitHub's hosted Ubuntu runner image.
+    # Give enough headroom so the job doesn't hit the hard 6h cap when the user selects 340.
+    # We compute: timeout = selected minutes + 20 extra minutes (setup/teardown cushion).
+    timeout-minutes: ${{ fromJSON(inputs.minutes) }}  # Job-level hard timeout (runner will abort after this).
+
+    steps:                                # Ordered list of steps executed in the same runner (same filesystem).
+      - name: Checkout
+        uses: actions/checkout@v4         # Pulls the repository code into the runner's working directory.
+                                          # Required so subsequent steps can access files (main.py, requirements.txt, etc).
+
+      - name: Setup Python
+        uses: actions/setup-python@v5     # Installs/configures a specific Python version on the runner.
+        with:
+          python-version: '3.11'          # Version used to run your FastAPI app and install dependencies.
+
+      - name: Install deps
+        run: |                            # Multi-line shell script (bash by default).
+          python -m pip install --upgrade pip         # Ensure latest pip (avoid old resolver bugs).
+          pip install -r requirements.txt             # Install project dependencies listed in requirements.txt.
+
+      - name: Start API (background)
+        run: |                            # Start the FastAPI app with uvicorn, detached from the foreground.
+          uvicorn main:app --host 0.0.0.0 --port 8000 > uvicorn.log 2>&1 &  # '&' = run in background; log to file.
+          echo $! > uvicorn.pid           # Save the background process ID (PID) to uvicorn.pid (for later cleanup).
+          sleep 3                         # Small wait so uvicorn can bind the port and be ready to accept requests.
+          ps -p $(cat uvicorn.pid) || (echo "Uvicorn failed"; tail -n+1 uvicorn.log; exit 1)
+                                          # Health check: if the PID isn't running, print logs and fail the job now.
+                                          # Early fail prevents tunneling a dead server (faster feedback).
+
+      # ---------- Attempt 1: Cloudflare Quick Tunnel with retries ----------
+      - name: Download cloudflared
+        run: |                            # Fetch the prebuilt cloudflared binary for Linux amd64.
+          curl -sSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared            # Make it executable so we can run it.
+
+      - name: Start Cloudflare tunnel (retry up to 5x)
+        id: cftunnel                      # Step ID so later steps can check 'steps.cftunnel.outcome'.
+        continue-on-error: true           # If we can't get a URL via Cloudflare, don't kill the job—try fallback next.
+        run: |
+          set -e                          # Stop on any command error within this step (except background processes).
+          ATTEMPTS=5                      # How many independent tries to obtain a quick tunnel URL.
+          for i in $(seq 1 $ATTEMPTS); do
+            echo "Attempt $i/$ATTEMPTS to start Cloudflare quick tunnel..."
+            ./cloudflared tunnel --url http://localhost:8000 --no-autoupdate > tunnel.log 2>&1 &  # Start in background.
+            TPID=$!                       # Capture cloudflared process ID to monitor/kill if needed.
+            # Wait loop: give cloudflared up to ~20 seconds to print the public URL in tunnel.log.
+            for j in $(seq 1 20); do
+              URL=$(grep -o 'https://[^ ]*trycloudflare.com' -m 1 tunnel.log || true)  # Grep the first URL match.
+              if [ -n "$URL" ]; then
+                echo "PUBLIC_URL=$URL" | tee public_url.txt  # Persist the URL so other steps can read it.
+                echo "OpenAPI docs: $URL/docs"               # Convenience message pointing to FastAPI Swagger UI.
+                echo "ok" > cftunnel_ok.flag                 # Create a marker file to signal success.
+                break                                        # Exit the inner wait loop.
+              fi
+              # If the tunnel process died, stop waiting (avoid sleeping out the full 20s).
+              kill -0 $TPID 2>/dev/null || break
+              sleep 1
+            done
+            # If we succeeded (marker file exists), exit the whole step with success.
+            if [ -f cftunnel_ok.flag ]; then
+              exit 0
+            fi
+            echo "Cloudflare attempt $i failed; logs:"
+            tail -n 50 tunnel.log || true    # Show last 50 lines for debugging (non-fatal if tail fails).
+            # Best-effort cleanup: kill the tunnel process if it's still alive before retrying.
+            kill $TPID 2>/dev/null || true
+            sleep 2                           # Short pause between attempts to avoid hammering the service.
+          done
+          exit 1                              # All attempts failed => mark this step as failed (but job continues).
+
+      # ---------- Fallback: LocalTunnel (no account required) ----------
+      - name: Setup Node (for LocalTunnel)
+        if: steps.cftunnel.outcome == 'failure'  # Only run if the Cloudflare step failed (based on its outcome).
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'               # Install Node.js v20 so we can run the LocalTunnel CLI via npx.
+
+      - name: Start LocalTunnel fallback
+        if: steps.cftunnel.outcome == 'failure'  # Only execute this if Cloudflare didn’t yield a URL.
+        run: |
+          npx --yes localtunnel@2 --port 8000 > lt.log 2>&1 &  # Launch LocalTunnel to expose localhost:8000.
+          # Wait up to ~20 seconds for LocalTunnel to print a public URL (usually *.loca.lt).
+          for i in $(seq 1 20); do
+            URL=$(grep -o 'https://[^ ]*\.loca\.lt' -m 1 lt.log || true)  # Extract the first loca.lt URL.
+            if [ -n "$URL" ]; then
+              echo "PUBLIC_URL=$URL" | tee public_url.txt  # Persist the URL for later steps.
+              echo "OpenAPI docs: $URL/docs"               # Convenience link to Swagger UI.
+              break
+            fi
+            sleep 1
+          done
+          # If no URL was found, dump logs and fail the step (and thus the job).
+          test -s public_url.txt || (echo "LocalTunnel did not provide a URL"; tail -n +1 lt.log; exit 1)
+
+      # ---------- Keep the runner alive so your API stays reachable ----------
+      - name: Keep alive for 60 minutes
+        run: |
+          echo "API is up for ~60 minutes."                 # Informative message in logs.
+          echo "Hit: $(cut -d= -f2 public_url.txt)/clean"   # Print the full POST endpoint (uses the public URL).
+          sleep 3600                                        # Sleep for 3600 seconds (~60 minutes) to keep the job running.
+                                                            # While sleeping, the tunnel keeps forwarding traffic to uvicorn.
+
+      # ---------- Cleanup: stop server and tunnels no matter what ----------
+      - name: Stop services
+        if: always()                                        # Ensure cleanup runs even if previous steps failed or timed out.
+        run: |
+          kill $(cat uvicorn.pid) 2>/dev/null || true       # Gracefully stop the uvicorn process if it exists.
+          pkill -f cloudflared 2>/dev/null || true          # Kill any cloudflared processes (best-effort).
+          pkill -f localtunnel 2>/dev/null || true          # Kill any LocalTunnel processes (best-effort).
+          echo "Stopped."                                    # Final log line confirming teardown.
